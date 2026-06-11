@@ -42,7 +42,11 @@ of the raw key_map inputs — `action_l`, `action_r`, `proprio_l`, `proprio_r`, 
 **Precondition for good mixing:** samples must be assigned to shards **at random** when the shards
 are built (interleaved across episodes), not one episode per shard. With content-contiguous shards
 the buffer's mixing ceiling is `buffer_size / dataset_size`; `shufflebuffer.warn_if_contiguous`
-flags that case. Producing the shards (the materializer) is upstream and separate from this loader.
+flags that case.
+
+Shards are produced by the companion materializer `egomimic/modal/build_sb_shards.py`
+(`build_index` → `plan` → `materialize`); workspace-specific settings live in a `CONFIG` block at
+its top. Run `modal run egomimic/modal/build_sb_shards.py::main`.
 
 ## Knobs
 
