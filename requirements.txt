@@ -59,3 +59,5 @@ scaleapi
 openai
 decord
 scale_sensor_fusion_io
+# shufflebuffer reservoir dataloader (for data=mecka_all_sb); pinned, public pip-installable
+shufflebuffer @ git+https://github.com/modal-projects/shufflebuffer.git@324aa3d084ea1b562b8e5281887765961dfa0b7c
