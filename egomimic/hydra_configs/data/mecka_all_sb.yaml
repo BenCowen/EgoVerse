@@ -1,0 +1,68 @@
+# shufflebuffer loader — pre-baked per-sample tar shards through a drip-fed shuffle buffer.
+#
+# Same sample dict / transforms / model as the zarr/zip path; only the storage + loader change.
+# Shards are WebDataset-style tars of per-sample records (<key>.jpg + <key>.npy) built once with
+# random sample->shard assignment (see SHUFFLEBUFFER.md). Point shard_dir at that directory.
+#
+# Launch (norm stats are precomputed → skip the norm pass):
+#   python -m egomimic.trainHydra model=hpt_bc_flow_mecka data=mecka_all_sb trainer=ddp \
+#     norm_stats.precomputed_norm_path=precomputed_norm_stats/mecka_all_zarr \
+#     data.train_datasets.mecka_bimanual.resolver.shard_dir=/shards/materialized/1gib-e1c6c3f9
+#
+# IterableDataset: shards are partitioned across world_size × num_workers consumers (disjoint,
+# per-epoch reshuffle identical on every rank), so DataLoader shuffle is False. Requirement:
+# #shards ≥ world_size × num_workers.
+
+_target_: egomimic.pl_utils.pl_data_utils.MultiDataModuleWrapper
+
+train_datasets:
+  mecka_bimanual:
+    _target_: egomimic.rldb.zarr.sb_shard_dataset.SBShardIterableDataset
+    resolver:
+      _target_: egomimic.rldb.zarr.sb_shard_dataset.ShardResolver
+      shard_dir: /shards/materialized/1gib-e1c6c3f9
+      key_map:
+        _target_: egomimic.rldb.embodiment.human.Mecka.get_keymap
+        mode: cartesian
+      transform_list:
+        _target_: egomimic.rldb.embodiment.human.Mecka.get_transform_list
+        mode: cartesian
+    mode: train
+    buffer_size: 10000      # reservoir size in samples (≈ 10k × ~62 KB ≈ 0.6 GB/worker)
+    prefetch: 2             # whole shards staged ahead (double-buffer)
+    prefetch_workers: 4
+    seed: 42
+
+valid_datasets:
+  mecka_bimanual:
+    _target_: egomimic.rldb.zarr.sb_shard_dataset.SBShardIterableDataset
+    resolver:
+      _target_: egomimic.rldb.zarr.sb_shard_dataset.ShardResolver
+      shard_dir: /shards/materialized/1gib-e1c6c3f9
+      key_map:
+        _target_: egomimic.rldb.embodiment.human.Mecka.get_keymap
+        mode: cartesian
+      transform_list:
+        _target_: egomimic.rldb.embodiment.human.Mecka.get_transform_list
+        mode: cartesian
+    mode: valid
+    buffer_size: 4000
+    prefetch: 2
+    prefetch_workers: 2
+    seed: 42
+
+train_dataloader_params:
+  mecka_bimanual:
+    batch_size: 128
+    num_workers: 12
+    persistent_workers: false
+    prefetch_factor: 4
+    shuffle: false          # IterableDataset shuffles internally (reservoir + per-epoch reshuffle)
+
+valid_dataloader_params:
+  mecka_bimanual:
+    batch_size: 128
+    num_workers: 4
+    persistent_workers: false
+    prefetch_factor: 2
+    shuffle: false
