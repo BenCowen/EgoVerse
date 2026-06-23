@@ -1,4 +1,5 @@
 import logging
+import os
 import random
 from typing import Literal
 
@@ -13,6 +14,41 @@ from transformers import AutoTokenizer
 from egomimic.utils.dataloader_ipc import apply_ipc_dataloader_params
 
 logger = logging.getLogger(__name__)
+
+
+class _PersistentIterLoader:
+    """Epoch-preserving wrapper for an Energon loader.
+
+    Lightning re-calls ``iter(loader)`` at the start of every epoch. For Energon that cold-restarts
+    iteration each epoch (new iterator: shuffle-buffer refilled from scratch, fresh watchdog/helper
+    threads, slice-state reset). On a dataset larger than the box's page cache this compounds into a
+    permanent data-throughput collapse a few hours in (data-wait grows while compute stays flat).
+
+    Because the Energon train stream is infinite (``get_train_dataset(..., repeat=True)``), the
+    "epoch" is already a synthetic boundary defined by ``limit_train_batches`` — not a real pass over
+    the data. So we can hold ONE long-lived underlying iterator and hand it back on every
+    ``iter()``: Lightning still counts batches, ends epochs, and fires every per-epoch hook
+    (checkpointing, LR step, EarlyStopping, validation) exactly as before — but the loader is never
+    re-``__iter__``'d, which removes the collapse trigger while keeping the epoch-based loop intact.
+    """
+
+    def __init__(self, loader):
+        self._loader = loader
+        self._it = None
+
+    def __iter__(self):
+        if self._it is None:
+            self._it = iter(self._loader)
+        return self  # we ARE the iterator; reused across epochs
+
+    def __next__(self):
+        if self._it is None:
+            self._it = iter(self._loader)
+        return next(self._it)
+
+    def __getattr__(self, name):
+        # delegate everything else (state_dict, __len__-guard, etc.) to the real loader
+        return getattr(self._loader, name)
 
 
 class RLDBModule(LightningDataModule):
@@ -219,7 +255,13 @@ class EnergonMultiDataModuleWrapper(MultiDataModuleWrapper):
             p = dict(p)
             bs = int(p["batch_size"])
             num_workers = int(p.get("num_workers", 0))
-            wc = WorkerConfig(rank=rank, world_size=world_size, num_workers=num_workers)
+            # seed_offset seeds Energon's shuffle RNG; distinct values make runs traverse the data in
+            # different orders. (MECKA_SEED_OFFSET env override is honored for quick A/B sweeps.)
+            seed_offset = int(getattr(ds, "seed_offset", 0) or 0)
+            if os.environ.get("MECKA_SEED_OFFSET") is not None:
+                seed_offset = int(os.environ["MECKA_SEED_OFFSET"])
+            wc = WorkerConfig(rank=rank, world_size=world_size, num_workers=num_workers,
+                              seed_offset=seed_offset)
             # parallel_shard_iters flows through get_train_dataset's **kwargs to the webdataset
             # factory; only pass it when set so we keep Energon's training default (16) otherwise.
             extra = {}
@@ -244,7 +286,23 @@ class EnergonMultiDataModuleWrapper(MultiDataModuleWrapper):
             )
             # NOTE: swap get_loader -> get_savable_loader in the resume follow-up PR; that exposes
             # save_state_global / restore_state_global for exact mid-epoch resume (see PR notes).
-            iterables[name] = get_loader(eds)
+            loader = get_loader(eds)
+            # Epoch-preserving robustness option (OPT-IN; default off). Energon's train stream is
+            # infinite (repeat=True), so a Lightning "epoch" is a synthetic limit_train_batches
+            # boundary, not a pass over the data. By default Lightning cold-restarts the loader at each
+            # epoch boundary (new shuffle, buffer refilled from scratch); when the working set ~ page
+            # cache this can compound into an intermittent permanent throughput collapse a few hours
+            # in. Reusing one long-lived iterator removes that trigger while keeping all per-epoch
+            # hooks intact (checkpoint / val / LR step / EarlyStopping still fire). Enable with
+            # persistent_iter=true if you hit that collapse. (Throughput-neutral at single-GPU;
+            # multi-GPU effect not yet cleanly measured — hence opt-in.)
+            persistent = bool(getattr(ds, "persistent_iter", False))
+            if os.environ.get("MECKA_PERSISTENT_ITER") is not None:
+                persistent = os.environ["MECKA_PERSISTENT_ITER"] == "1"
+            if persistent:
+                loader = _PersistentIterLoader(loader)
+            logger.info("[energon] %s: persistent_iter=%s seed_offset=%d", name, persistent, seed_offset)
+            iterables[name] = loader
         return CombinedLoader(iterables, "max_size_cycle")
 
     def train_dataloader(self):

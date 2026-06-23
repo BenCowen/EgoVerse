@@ -39,6 +39,12 @@ train_datasets:
     max_samples_per_sequence: 64    # consecutive samples per shard before switching (null = whole shard)
     parallel_shard_iters: 64        # shards open per worker, shuffled between (null = Energon default 16)
     shuffle_over_epochs_multiplier: 2  # shuffle shard-slice order over N epochs (>=1)
+    # Epoch-preserving robustness (OPT-IN). Set true to reuse one iterator across Lightning epochs so
+    # the loader is not cold-restarted each epoch — prevents an intermittent throughput collapse seen
+    # when the working set ~ RAM (all per-epoch hooks still fire). Throughput-neutral at single-GPU;
+    # multi-GPU effect not yet cleanly measured, so left off by default. Enable if you hit the collapse.
+    persistent_iter: false
+    seed_offset: 0                  # Energon shuffle seed; vary to traverse data in a different order
 
 valid_datasets:
   mecka_bimanual:
@@ -50,6 +56,8 @@ valid_datasets:
     max_samples_per_sequence: 64
     parallel_shard_iters: 64
     shuffle_over_epochs_multiplier: 2
+    persistent_iter: true
+    seed_offset: 0
 
 train_dataloader_params:
   mecka_bimanual:

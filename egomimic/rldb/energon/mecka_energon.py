@@ -160,6 +160,16 @@ class EnergonShardDataset:
             (None = Energon default, 16 in training). Higher = more distinct shards feeding the
             shuffle buffer = better mixing at a given buffer, at the cost of more open file handles.
         shuffle_over_epochs_multiplier: shuffle the shard-slice order over this many epochs (>=1).
+        persistent_iter: OPT-IN (default False). When True, reuse ONE Energon iterator across
+            Lightning epochs instead of letting Lightning cold-restart the loader at every epoch
+            boundary. The stream is infinite (repeat=True), so epochs remain synthetic
+            limit_train_batches boundaries and all per-epoch hooks still fire — this just removes the
+            cold-restart that can trigger an intermittent permanent throughput collapse when the
+            working set ~ page cache. Enable it if you observe that collapse. Evidence so far:
+            throughput-neutral at single-GPU; effect at multi-GPU not yet cleanly measured (see
+            repro/results/epoch-rollover/). Hence opt-in rather than default.
+        seed_offset: seeds Energon's shuffle RNG (WorkerConfig.seed_offset); change it to traverse the
+            data in a different order across runs.
     """
 
     def __init__(
@@ -171,6 +181,8 @@ class EnergonShardDataset:
         max_samples_per_sequence: int | None = None,
         parallel_shard_iters: int | None = None,
         shuffle_over_epochs_multiplier: int = 1,
+        persistent_iter: bool = False,
+        seed_offset: int = 0,
     ):
         self.shard_dir = shard_dir
         self.split_part = split_part
@@ -179,6 +191,8 @@ class EnergonShardDataset:
         self.max_samples_per_sequence = max_samples_per_sequence
         self.parallel_shard_iters = parallel_shard_iters
         self.shuffle_over_epochs_multiplier = shuffle_over_epochs_multiplier
+        self.persistent_iter = persistent_iter
+        self.seed_offset = seed_offset
         self.embodiment_id = get_embodiment_id(embodiment_name)
         self.data_schematic = None
         self._epoch = 0
