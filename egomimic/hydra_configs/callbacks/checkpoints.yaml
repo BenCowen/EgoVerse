@@ -2,10 +2,25 @@ defaults:
   - defaults
   - _self_
 
+# Epoch-cadence archival snapshots. Kept indefinitely (save_top_k: -1) for evaluation.
 model_checkpoint:
   _target_: lightning.pytorch.callbacks.ModelCheckpoint
   dirpath: ${paths.output_dir}/checkpoints
   filename: "epoch_{epoch}"
-  save_last: true
   save_top_k: -1
   every_n_epochs: 100
+  save_last: false
+
+# Step-cadence rolling checkpoint for preemption resume. A ModelCheckpoint instance may set
+# only one of every_n_train_steps / every_n_epochs, so this is a second, separate callback.
+# An abrupt preemption/XID can hit hours before an epoch boundary (and Energon epochs are
+# huge), so epoch-only checkpointing loses everything on a crash. save_top_k: 0 keeps no
+# step archives; save_last keeps a single rolling last.ckpt that trainHydra's resume path
+# restores. Override the cadence per run with
+# ++callbacks.model_checkpoint_resume.every_n_train_steps=N.
+model_checkpoint_resume:
+  _target_: lightning.pytorch.callbacks.ModelCheckpoint
+  dirpath: ${paths.output_dir}/checkpoints
+  save_top_k: 0
+  every_n_train_steps: 2000
+  save_last: true
