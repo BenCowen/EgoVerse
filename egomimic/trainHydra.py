@@ -10,6 +10,7 @@ import torch
 from lightning import Callback, LightningDataModule, LightningModule, Trainer
 from lightning.pytorch.loggers import Logger
 from lightning.pytorch.plugins.environments import SLURMEnvironment
+from lightning.pytorch.plugins.io import TorchCheckpointIO
 from omegaconf import DictConfig, OmegaConf, open_dict
 from tabulate import tabulate
 
@@ -27,6 +28,51 @@ from egomimic.utils.utils import extras, task_wrapper
 OmegaConf.register_new_resolver("eval", eval)
 OmegaConf.register_new_resolver("multiply", lambda x, y: int(float(x)) * int(float(y)))
 log = RankedLogger(__name__, rank_zero_only=True)
+
+
+class AtomicCheckpointIO(TorchCheckpointIO):
+    """Write checkpoints to a temp file and os.replace() into place.
+
+    Lightning's default TorchCheckpointIO writes last.ckpt in place, so an abrupt preemption
+    (SIGKILL) or a volume snapshot taken mid-write can leave a truncated zip that bricks the
+    next resume with 'PytorchStreamReader failed reading zip archive'. os.replace is atomic
+    within a filesystem, so any reader/commit sees either the complete old or the complete new
+    checkpoint — never a partial one. Essential when preemptions are expected.
+    """
+
+    def save_checkpoint(self, checkpoint, path, storage_options=None):
+        path = str(path)
+        tmp = path + ".tmp"
+        super().save_checkpoint(checkpoint, tmp, storage_options=storage_options)
+        os.replace(tmp, path)
+
+
+def _pick_resumable_ckpt(ckpt_dir: str) -> Optional[str]:
+    """Newest checkpoint under ckpt_dir whose zip archive is intact, last.ckpt first.
+
+    Belt-and-suspenders against a corrupt latest checkpoint: even with atomic writes, if the
+    most recent file is somehow unreadable we fall back to the next-newest intact one rather
+    than crash-looping. Returns None if the dir has no readable checkpoint (→ start fresh).
+    """
+    import glob
+    import zipfile
+
+    cands = sorted(
+        glob.glob(os.path.join(ckpt_dir, "*.ckpt")), key=os.path.getmtime, reverse=True
+    )
+    last = os.path.join(ckpt_dir, "last.ckpt")
+    if os.path.exists(last):  # prefer last.ckpt regardless of mtime ordering
+        cands = [last] + [c for c in cands if os.path.abspath(c) != os.path.abspath(last)]
+    for c in cands:
+        try:
+            with zipfile.ZipFile(c) as zf:  # truncated/torn ckpt fails here (central dir / namelist)
+                zf.namelist()
+            return c
+        except Exception as e:
+            log.warning(
+                f"checkpoint '{c}' is unreadable ({type(e).__name__}: {e}); trying an older one"
+            )
+    return None
 
 
 def _build_model_config_tree(cfg: DictConfig) -> DictConfig:
@@ -157,15 +203,25 @@ def train(cfg: DictConfig) -> Tuple[Dict[str, Any], Dict[str, Any]]:
         data_schematic.infer_shapes_from_batch(dataset[0])
         log.info(f"[Timing] Shape inference for {dataset_name}: {time.perf_counter() - t_shape:.2f}s")
 
-        instantiate_copy = copy.deepcopy(cfg.data.train_datasets[dataset_name])
-        keymap_cfg = instantiate_copy.resolver.key_map
-        km = OmegaConf.to_container(keymap_cfg, resolve=False)  # plain dict
+        precomputed_norm_path = OmegaConf.select(
+            cfg, "norm_stats.precomputed_norm_path", default=None
+        )
+        # Build the norm-stats dataset (a plain pose/action reader) only when we actually compute
+        # norm from data. With a precomputed path the stats are loaded from JSON and the dataset is
+        # never touched (see DataSchematic.infer_norm_from_dataset) — so skip the build entirely.
+        # This also lets loaders whose config has no `resolver.key_map` (e.g. data=mecka_all_energon)
+        # run, as long as norm stats are precomputed.
+        norm_dataset = None
+        if precomputed_norm_path is None:
+            instantiate_copy = copy.deepcopy(cfg.data.train_datasets[dataset_name])
+            keymap_cfg = instantiate_copy.resolver.key_map
+            km = OmegaConf.to_container(keymap_cfg, resolve=False)  # plain dict
 
-        # this remove annotation and image keys from the keymap
-        km["norm_mode"] = True
+            # this remove annotation and image keys from the keymap
+            km["norm_mode"] = True
 
-        instantiate_copy.resolver.key_map = km
-        norm_dataset = hydra.utils.instantiate(instantiate_copy)
+            instantiate_copy.resolver.key_map = km
+            norm_dataset = hydra.utils.instantiate(instantiate_copy)
         # infer_norm_from_dataset: load from precomputed JSON/dir if set, else compute (no disk write).
         t_norm = time.perf_counter()
         data_schematic.infer_norm_from_dataset(
@@ -173,9 +229,7 @@ def train(cfg: DictConfig) -> Tuple[Dict[str, Any], Dict[str, Any]]:
             dataset_name,
             sample_frac=OmegaConf.select(cfg, "norm_stats.sample_frac", default=1.0),
             num_workers=OmegaConf.select(cfg, "norm_stats.num_workers", default=4),
-            precomputed_norm_path=OmegaConf.select(
-                cfg, "norm_stats.precomputed_norm_path", default=None
-            ),
+            precomputed_norm_path=precomputed_norm_path,
         )
         log.info(f"[Timing] Norm stats for {dataset_name}: {time.perf_counter() - t_norm:.2f}s")
         # Cache norm stats if save_cache_dir is set
@@ -271,7 +325,8 @@ def train(cfg: DictConfig) -> Tuple[Dict[str, Any], Dict[str, Any]]:
     logger: List[Logger] = instantiate_loggers(cfg.get("logger"))
 
     log.info(f"Instantiating trainer <{cfg.trainer._target_}>")
-    plugins = []
+    # Atomic checkpoint writes so a preemption can't leave a truncated last.ckpt (see class doc).
+    plugins = [AtomicCheckpointIO()]
     if os.environ.get("SLURM_JOB_ID"):
         plugins.append(
             SLURMEnvironment(requeue_signal=[signal.SIGUSR1, signal.SIGUSR2])
@@ -281,7 +336,7 @@ def train(cfg: DictConfig) -> Tuple[Dict[str, Any], Dict[str, Any]]:
     with open_dict(cfg):
         cfg.trainer.pop("_modal", None)
     trainer: Trainer = hydra.utils.instantiate(
-        cfg.trainer, callbacks=callbacks, logger=logger
+        cfg.trainer, callbacks=callbacks, logger=logger, plugins=plugins
     )
 
     object_dict = {
@@ -297,15 +352,26 @@ def train(cfg: DictConfig) -> Tuple[Dict[str, Any], Dict[str, Any]]:
         log.info("Logging hyperparameters!")
         log_hyperparameters(object_dict)
 
-    if (
-        os.environ.get("SLURM_JOB_ID")
-        and os.environ.get("SLURM_RESTART_COUNT", "0") != "0"
-    ):
-        last_ckpt_path = os.path.join(
-            trainer.default_root_dir, "checkpoints", "last.ckpt"
-        )
-        log.info("Detected SLURM requeue — resuming from 'last.ckpt'")
-        cfg.ckpt_path = last_ckpt_path
+    # Resume on ANY restart, not just SLURM requeue: if a rolling 'last.ckpt' already exists under
+    # this run's (volume-backed) default_root_dir and no explicit ckpt_path was given, pick it up.
+    # This makes the run preemption/XID-resilient — a fresh container started after a crash detects
+    # "I'm a restart" and continues from the last checkpoint instead of from step 0. (A genuinely
+    # fresh run has no last.ckpt, so it starts from scratch as normal.)
+    _slurm_requeue = bool(
+        os.environ.get("SLURM_JOB_ID") and os.environ.get("SLURM_RESTART_COUNT", "0") != "0"
+    )
+    _ckpt_dir = os.path.join(trainer.default_root_dir, "checkpoints")
+    _last_ckpt = os.path.join(_ckpt_dir, "last.ckpt")
+    if not cfg.get("ckpt_path") and (_slurm_requeue or os.path.exists(_last_ckpt)):
+        why = "SLURM requeue" if _slurm_requeue else "found last.ckpt (restart/preemption)"
+        # Validate before handing to Lightning: a corrupt latest ckpt falls back to the newest
+        # intact one (or a fresh start) instead of crash-looping the resume forever.
+        _resume = _pick_resumable_ckpt(_ckpt_dir)
+        if _resume:
+            log.info(f"Resuming from '{_resume}' — {why}")
+            cfg.ckpt_path = _resume
+        else:
+            log.warning(f"{why} but no intact checkpoint in '{_ckpt_dir}'; starting fresh")
 
     os.makedirs(os.path.join(trainer.default_root_dir, "videos"), exist_ok=True)
 
